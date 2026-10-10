@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dispatcher-hybrid-2"
+version = "0.1.0"
+description = "An attention-light language model: gated dyadic shift-and-sum with a few sliding-window attention layers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Alberto Cetoli", email = "alberto@fractalego.io" }]
+keywords = ["language-model", "attention-free", "dispatcher", "subquadratic", "transformers"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "tiktoken>=0.7"]
+
+[project.urls]
+Homepage = "https://github.com/fractalego/dispatcher-hybrid-2"
+Paper = "https://arxiv.org/abs/2105.03994"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dispatcher_hybrid"]

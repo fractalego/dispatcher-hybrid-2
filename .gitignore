@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+# converted weights live on the HuggingFace Hub, not in git
+dispatcher-hybrid-292m/
+*.safetensors
+*.pt
+*.jsonl
