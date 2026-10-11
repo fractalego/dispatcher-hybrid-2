@@ -223,3 +223,12 @@ perturbing token *t* leaves every logit before *t* exactly unchanged.
 ```
 
 MIT licensed.
+
+---
+
+*Alberto's note: This work has been written together with various iterations
+of Claude Code. Claude has proven to be an invaluable assistant and sped up
+the revival of this old project of mine. I appreciate many fields are still
+struggling with the arrival of talking machines. I am familiar with most
+points of view on this topic. However, it would be dishonest not to admit
+that Claude has been central to this project.*
