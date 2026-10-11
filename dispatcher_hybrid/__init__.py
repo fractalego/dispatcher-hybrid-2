@@ -8,7 +8,7 @@ with 2 sliding-window attention layers.
 from .configuration_dispatcher import DispatcherConfig
 from .modeling_dispatcher import DispatcherHybridForCausalLM
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = ["DispatcherConfig", "DispatcherHybridForCausalLM"]
 
 try:  # make AutoConfig/AutoModelForCausalLM aware of the architecture
