@@ -32,9 +32,12 @@ position.
 
 Known limits (both inherited from the research implementation):
   * batch 1;
-  * V_lev is the naive dense layout -- level l only ever needs its last 2^l
-    slots, so a ring buffer would cut tree-cache memory ~13x. At 4096 context
-    this costs ~1.75GB in bf16 across 16 tree layers.
+  * V_lev is the naive dense layout: (levels+1, max_len, d) per tree layer,
+    1.74GB in bf16 at 4096 context across 16 tree layers. Level l only ever
+    reads at lag 2^l, so it needs a ring of 2^(l+1) slots (doubled to keep the
+    write at t from colliding with the read at t-2^l, and to keep the index a
+    bitmask). That totals 2^(levels+1)-2 = 8190 slots against 53248 today,
+    i.e. ~270MB -- a 6.5x cut, deliberately deferred.
 """
 
 import math

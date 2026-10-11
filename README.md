@@ -96,8 +96,9 @@ logits = dec.step(next_token)               # (vocab,), O(log t)
 ```
 
 Caveats, all inherited from the research implementation: **batch size 1**, and
-the per-level cache uses a dense layout (~1.75 GB at 4096 context) where a ring
-buffer would need ~13x less. `fast_generate(decoder=...)` picks `"fused"`,
+the per-level cache uses a dense layout — 1.74 GB at 4096 context, where a
+ring buffer sized per level would need ~270 MB (level l only ever reads at lag
+2^l, so it needs 2^(l+1) slots, not the whole context). `fast_generate(decoder=...)` picks `"fused"`,
 `"graphed"` or `"eager"`; `"auto"` takes the best available. Graph capture
 costs ~0.1s once, so very short generations see less than the table suggests.
 
