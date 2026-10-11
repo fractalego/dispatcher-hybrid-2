@@ -25,6 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Triton kernels for the fused decoder and the fused prefill path (CUDA only)
+fast = ["triton>=3.0"]
 dev = ["pytest>=8", "tiktoken>=0.7"]
 
 [project.urls]

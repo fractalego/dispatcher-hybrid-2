@@ -75,6 +75,8 @@ Known weaknesses, measured rather than assumed:
 - **Arbitrary in-context binding** degrades with load (78% at 8 key-value
   pairs, 50% at 128) and is effectively zero beyond the 1024-token attention
   window. Semantic retrieval through the tree is unaffected.
-- **Generation recomputes the prefix each step** in this release (~40 tok/s on
-  an A6000 at short context); no cache is wired up yet.
+- **Fast decoding is batch-1.** `generate()` recomputes the prefix each step
+  (44 tok/s at 256 context, 9 tok/s at 3900); the package's incremental
+  decoders hold the per-level state instead and run at ~530 tok/s flat in
+  context, but only for a single sequence. See the repository README.
 - **4096-token context**, fixed by the number of dyadic levels.

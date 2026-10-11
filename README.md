@@ -32,7 +32,8 @@ in-context binding turns out to need real comparison (see Limitations).
 ## Install
 
 ```bash
-pip install dispatcher-hybrid-2
+pip install dispatcher-hybrid-2          # model + weights loading
+pip install dispatcher-hybrid-2[fast]    # + Triton kernels (CUDA) for fast decoding
 ```
 
 ## Use
@@ -54,6 +55,62 @@ It is a standard `PreTrainedModel`, so `AutoModelForCausalLM`, `save_pretrained`
 device maps, `labels=...` for a training loss, and `generate()` all work.
 Greedy decoding on a 292M base model loops quickly; sampling is the better
 default.
+
+For anything longer than a few tokens, use `fast_generate` instead — same
+tokens, far less work (see below):
+
+```python
+model = model.to("cuda", torch.bfloat16)
+out = model.fast_generate(ids.to("cuda"), max_new_tokens=200, do_sample=True,
+                          temperature=0.8, top_k=50)
+```
+
+## Decoding: where the architecture pays off
+
+`generate()` re-runs the entire prefix for every new token. The incremental
+decoders keep the tree's per-level state instead, so a token costs O(log t)
+regardless of how long the context is — a transformer, by contrast, re-reads a
+KV cache that grows with t. Measured on an A6000, 292M weights in bf16,
+steady-state tokens/second:
+
+| context | `generate()` (recompute) | eager | + CUDA graph | + Triton kernels |
+|---|---|---|---|---|
+| 256 | 43.8 | 44.0 | 277.6 | **534.8** |
+| 1024 | 36.5 | 44.5 | 285.9 | **534.1** |
+| 2048 | 17.2 | 44.4 | 282.0 | **534.1** |
+| 3900 | 9.1 | 43.8 | 285.9 | **525.1** |
+
+The incremental columns are flat in context, as the mechanism predicts; at
+3,900 tokens the fused decoder is 58x the recompute path. The reason the eager
+column is slow in absolute terms is that the per-token arithmetic is tiny and
+the step becomes kernel-launch-bound — graph capture removes the launch
+overhead, and the Triton kernels collapse the per-level serial chain into one
+kernel's internal loop.
+
+```python
+from dispatcher_hybrid.decoding import FusedGraphedHybridDecoder
+
+dec = FusedGraphedHybridDecoder(model)      # or GraphedHybridDecoder / IncrementalDecoder
+logits = dec.prefill(ids[0])                # (T, vocab)
+logits = dec.step(next_token)               # (vocab,), O(log t)
+```
+
+Caveats, all inherited from the research implementation: **batch size 1**, and
+the per-level cache uses a dense layout (~1.75 GB at 4096 context) where a ring
+buffer would need ~13x less. `fast_generate(decoder=...)` picks `"fused"`,
+`"graphed"` or `"eager"`; `"auto"` takes the best available. Graph capture
+costs ~0.1s once, so very short generations see less than the table suggests.
+
+The same Triton machinery speeds up the parallel forward, which is what
+prefill and fine-tuning use:
+
+```python
+model.enable_fused_gates()   # ~1.3x forward, -28% peak memory at 4096 context
+```
+
+Both fused paths return gate pre-activations in bf16, so they shift numerics
+at bf16 rounding level; the eager path stays the correctness reference and the
+test suite pins both against it.
 
 ## What it scores
 
@@ -116,12 +173,9 @@ full attention stacks — binding capacity tracks the two attention layers.
 Beyond the 1024-token attention window arbitrary binding is effectively zero;
 semantic retrieval still works through the tree.
 
-**Generation recomputes.** There is no KV-cache equivalent wired up in this
-release, so `generate()` re-runs the prefix each step (~40 tok/s at short
-context on an A6000). An exact incremental decoder exists in the research code
-— per-token cost is constant in context length there, which is where this
-architecture's serving advantage actually lives — and porting it here is the
-next planned addition.
+**Generation is batch-1 on the fast path.** `generate()` handles batches but
+recomputes the prefix; the incremental decoders are single-sequence. Batched
+incremental decoding is not implemented.
 
 **Context is 4096 tokens**, fixed by the 12 dyadic levels. Longer contexts
 need additional levels (and the gates to be trained for them).
@@ -135,7 +189,11 @@ python scripts/convert_checkpoint.py --checkpoint path/to/final.pt --out ./dispa
 # reproduce the held-out CE (2.5543)
 python scripts/reproduce_eval.py --model ./dispatcher-hybrid-292m --val-file val_window.jsonl
 
-# causality, doc-boundary isolation, and parity against the research code
+# decode throughput vs context length
+python scripts/benchmark_decode.py --model ./dispatcher-hybrid-292m
+
+# causality, doc-boundary isolation, decoder exactness, and parity against
+# the research implementation
 pytest tests/
 ```
 

@@ -45,6 +45,7 @@ class DispatcherMixer(nn.Module):
         self.levels = config.levels
         self.shifts = [2 ** i for i in range(self.levels)]
 
+        self.use_fused_gates = False   # set via model.enable_fused_gates()
         gh = d_model  # gate hidden width (gate_hidden_dim=None in the release config)
         self.linear_in = nn.Linear(d_model, d_model, bias=False)
         self.gate_hidden = nn.Linear(d_model, gh, bias=False)       # W1x, destination
@@ -82,21 +83,35 @@ class DispatcherMixer(nn.Module):
             m4 = mask[:, :n_lv].view(1, length, n_lv, 1)
             mbh = mask[:, :n_lv]
 
-        # source features per level, with wrapped (future) rows zeroed
-        rolled = torch.stack([torch.roll(B, shifts=s, dims=1)
-                              for s in self.shifts[:n_lv]], dim=2) * m4
-        hidden = F.relu(A.unsqueeze(2) + rolled) ** 2                # (B, T, n_lv, gh)
-
-        def heads_first(param, bias):
-            pre = torch.einsum("btld,lhd->btlh", hidden, param[:n_lv]) + bias[:n_lv]
+        def heads_first(pre):
             return torch.sigmoid(pre).permute(0, 3, 1, 2).reshape(
-                batch * heads, length, n_lv)
+                batch * heads, length, n_lv).to(V.dtype)
 
-        admit = heads_first(self.gate_out, self.gate_out_bias) * mbh
+        if self.use_fused_gates and x.is_cuda:
+            # Triton path: the (B, T, levels, gh) hidden tensor is the mixer's
+            # cost center (~400MB/layer at 4096 context); these kernels build it
+            # a tile at a time in SRAM and contract immediately, so it never
+            # exists. Masks are applied in-kernel.
+            from .fused_gates import fused_gate_preacts
+            pre_i, pre_f, pre_r = fused_gate_preacts(
+                A, B, self.gate_out, self.forget_out, self.reset_out,
+                self.gate_out_bias, self.forget_out_bias, self.reset_out_bias,
+                n_lv, mask[..., :n_lv] if mask.dim() == 3 else None)
+        else:
+            # source features per level, with wrapped (future) rows zeroed
+            rolled = torch.stack([torch.roll(B, shifts=s, dims=1)
+                                  for s in self.shifts[:n_lv]], dim=2) * m4
+            hidden = F.relu(A.unsqueeze(2) + rolled) ** 2            # (B, T, n_lv, gh)
+            pre_i, pre_f, pre_r = (
+                torch.einsum("btld,lhd->btlh", hidden, p[:n_lv]) + b[:n_lv]
+                for p, b in ((self.gate_out, self.gate_out_bias),
+                             (self.forget_out, self.forget_out_bias),
+                             (self.reset_out, self.reset_out_bias)))
+
+        admit = heads_first(pre_i) * mbh
         # masked levels receive no message, so they must not forget: f -> 1
-        forget = heads_first(self.forget_out, self.forget_out_bias)
-        forget = forget * mbh + (1.0 - mbh)
-        transmit = heads_first(self.reset_out, self.reset_out_bias)
+        forget = heads_first(pre_f) * mbh + (1.0 - mbh)
+        transmit = heads_first(pre_r)
 
         for li, shift in enumerate(self.shifts[:n_lv]):
             if shift > length:
@@ -126,7 +141,7 @@ class WindowAttention(nn.Module):
 
         self._rope_key = None
 
-    def _rope_tables(self, length, device, dtype):
+    def rope_tables(self, length, device, dtype):
         """RoPE cos/sin, computed on demand and cached.
 
         Deliberately NOT a registered buffer: a non-persistent buffer is absent
@@ -146,7 +161,7 @@ class WindowAttention(nn.Module):
         return self._rope
 
     def apply_rope(self, x, length):
-        cos, sin = self._rope_tables(length, x.device, x.dtype)
+        cos, sin = self.rope_tables(length, x.device, x.dtype)
         x1, x2 = x[..., 0::2], x[..., 1::2]
         return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
@@ -346,3 +361,68 @@ class DispatcherHybridForCausalLM(DispatcherPreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         # no cache: always feed the (cropped) prefix
         return {"input_ids": input_ids[:, -self.config.max_len:]}
+
+    def enable_fused_gates(self, enabled=True):
+        """Use the Triton gate kernels in the parallel forward (CUDA only).
+
+        ~1.4x faster with ~34% less activation memory at full shapes, at
+        bf16 rounding in the gate pre-activations. Needs `triton` installed
+        (`pip install dispatcher-hybrid-2[fast]`).
+        """
+        if enabled:
+            from . import fused_gates  # noqa: F401 — fail now, not mid-forward
+        for blk in self.blocks:
+            if hasattr(blk, "mixer"):
+                blk.mixer.use_fused_gates = enabled
+        return self
+
+    @torch.no_grad()
+    def fast_generate(self, input_ids, max_new_tokens=50, do_sample=False,
+                      temperature=1.0, top_k=None, eos_token_id=None,
+                      decoder="auto"):
+        """Generate with an exact incremental decoder instead of recomputing.
+
+        `generate()` re-runs the whole prefix for every token; this keeps the
+        per-level caches, so per-token cost is O(log t) and flat in context.
+        Batch size 1 only. `decoder` is "auto" (best available), "eager",
+        "graphed" (CUDA graph) or "fused" (CUDA graph + Triton kernels).
+        """
+        from .decoding import (IncrementalDecoder, GraphedHybridDecoder,
+                               FusedGraphedHybridDecoder)
+        ids = input_ids.view(-1)
+        if input_ids.dim() == 2 and input_ids.shape[0] != 1:
+            raise ValueError("fast_generate supports batch size 1; use generate()")
+
+        choices = {"eager": IncrementalDecoder, "graphed": GraphedHybridDecoder,
+                   "fused": FusedGraphedHybridDecoder}
+        if decoder == "auto":
+            order = ["eager"]
+            if ids.is_cuda:
+                order = ["fused", "graphed", "eager"]
+            dec = None
+            for name in order:
+                try:
+                    dec = choices[name](self)
+                    break
+                except Exception:
+                    continue
+            if dec is None:
+                raise RuntimeError("no usable decoder")
+        else:
+            dec = choices[decoder](self)
+
+        logits = dec.prefill(ids)[-1]
+        out = [ids]
+        for _ in range(max_new_tokens):
+            logits = logits.float() / max(temperature, 1e-6)
+            if top_k is not None:
+                logits[logits < torch.topk(logits, top_k).values[-1]] = float("-inf")
+            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1) if do_sample
+                   else logits.argmax().view(1))
+            out.append(nxt)
+            if eos_token_id is not None and int(nxt) == eos_token_id:
+                break
+            if dec.t >= dec.max_len:
+                break
+            logits = dec.step(nxt)
+        return torch.cat(out).unsqueeze(0)
