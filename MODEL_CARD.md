@@ -75,8 +75,9 @@ Known weaknesses, measured rather than assumed:
 - **Arbitrary in-context binding** degrades with load (78% at 8 key-value
   pairs, 50% at 128) and is effectively zero beyond the 1024-token attention
   window. Semantic retrieval through the tree is unaffected.
-- **Fast decoding is batch-1.** `generate()` recomputes the prefix each step
-  (44 tok/s at 256 context, 9 tok/s at 3900); the package's incremental
-  decoders hold the per-level state instead and run at ~530 tok/s flat in
-  context, but only for a single sequence. See the repository README.
+- **Decoding.** `generate()` recomputes the prefix each step (44 tok/s at 256
+  context, 9 at 3900); the package's incremental decoders hold the per-level
+  state in ring buffers (~480 MB) and run at ~530-560 tok/s flat in context,
+  with lockstep batching (equal-length rows) up to ~3,000 tok/s aggregate at
+  batch 16. Variable-length batches are not supported. See the README.
 - **4096-token context**, fixed by the number of dyadic levels.

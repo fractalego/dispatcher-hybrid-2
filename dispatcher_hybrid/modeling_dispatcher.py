@@ -379,26 +379,34 @@ class DispatcherHybridForCausalLM(DispatcherPreTrainedModel, GenerationMixin):
     @torch.no_grad()
     def fast_generate(self, input_ids, max_new_tokens=50, do_sample=False,
                       temperature=1.0, top_k=None, eos_token_id=None,
-                      decoder="auto"):
+                      num_return_sequences=1, decoder="auto"):
         """Generate with an exact incremental decoder instead of recomputing.
 
         `generate()` re-runs the whole prefix for every token; this keeps the
         per-level caches, so per-token cost is O(log t) and flat in context.
-        Batch size 1 only. `decoder` is "auto" (best available), "eager",
-        "graphed" (CUDA graph) or "fused" (CUDA graph + Triton kernels).
+
+        input_ids: (T,) or (B, T) — rows run in lockstep, so a 2-D batch must
+        share one prompt length (no padding). num_return_sequences tiles a
+        single prompt into a batch of samples. `decoder` is "auto" (best
+        available), "eager", "graphed" (CUDA graph) or "fused" (graph +
+        Triton kernels). Rows that hit eos are frozen (padded with eos) while
+        the rest continue.
         """
         from .decoding import (IncrementalDecoder, GraphedHybridDecoder,
                                FusedGraphedHybridDecoder)
-        ids = input_ids.view(-1)
-        if input_ids.dim() == 2 and input_ids.shape[0] != 1:
-            raise ValueError("fast_generate supports batch size 1; use generate()")
+        ids = input_ids.view(1, -1) if input_ids.dim() == 1 else input_ids
+        if num_return_sequences > 1:
+            if ids.shape[0] != 1:
+                raise ValueError("num_return_sequences needs a single prompt")
+            if not do_sample:
+                raise ValueError("num_return_sequences without sampling would "
+                                 "return identical rows")
+            ids = ids.expand(num_return_sequences, -1)
 
         choices = {"eager": IncrementalDecoder, "graphed": GraphedHybridDecoder,
                    "fused": FusedGraphedHybridDecoder}
         if decoder == "auto":
-            order = ["eager"]
-            if ids.is_cuda:
-                order = ["fused", "graphed", "eager"]
+            order = ["fused", "graphed", "eager"] if ids.is_cuda else ["eager"]
             dec = None
             for name in order:
                 try:
@@ -411,18 +419,24 @@ class DispatcherHybridForCausalLM(DispatcherPreTrainedModel, GenerationMixin):
         else:
             dec = choices[decoder](self)
 
-        logits = dec.prefill(ids)[-1]
+        Bb = ids.shape[0]
+        logits = dec.prefill(ids)[:, -1]                       # (B, vocab)
+        finished = torch.zeros(Bb, dtype=torch.bool, device=ids.device)
         out = [ids]
         for _ in range(max_new_tokens):
             logits = logits.float() / max(temperature, 1e-6)
             if top_k is not None:
-                logits[logits < torch.topk(logits, top_k).values[-1]] = float("-inf")
-            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1) if do_sample
-                   else logits.argmax().view(1))
-            out.append(nxt)
-            if eos_token_id is not None and int(nxt) == eos_token_id:
+                kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            nxt = (torch.multinomial(F.softmax(logits, dim=-1), 1)[:, 0] if do_sample
+                   else logits.argmax(-1))
+            if eos_token_id is not None:
+                nxt = torch.where(finished, torch.full_like(nxt, eos_token_id), nxt)
+                finished = finished | (nxt == eos_token_id)
+            out.append(nxt.unsqueeze(1))
+            if eos_token_id is not None and bool(finished.all()):
                 break
             if dec.t >= dec.max_len:
                 break
             logits = dec.step(nxt)
-        return torch.cat(out).unsqueeze(0)
+        return torch.cat(out, dim=1)

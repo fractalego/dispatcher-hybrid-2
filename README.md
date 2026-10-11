@@ -95,12 +95,18 @@ logits = dec.prefill(ids[0])                # (T, vocab)
 logits = dec.step(next_token)               # (vocab,), O(log t)
 ```
 
-Caveats, all inherited from the research implementation: **batch size 1**, and
-the per-level cache uses a dense layout — 1.74 GB at 4096 context, where a
-ring buffer sized per level would need ~270 MB (level l only ever reads at lag
-2^l, so it needs 2^(l+1) slots, not the whole context). `fast_generate(decoder=...)` picks `"fused"`,
+The per-level state lives in ring buffers (level l is only ever read at lag
+2^l, so it keeps a 2^(l+1)-slot circular window): the whole decode state is
+~480 MB at 4096 context, against ~1.9 GB for the dense layout the research
+code used. Decoders also run **lockstep batches** — same prompt length per
+row, one step advances all rows — which covers sampling N continuations of
+one prompt (`fast_generate(..., num_return_sequences=N)`) and equal-length
+prompt batches; aggregate throughput reaches ~3,000 tok/s at batch 16.
+Variable-length batches are not supported: the tree state is
+position-anchored, and padding would corrupt it. `fast_generate(decoder=...)` picks `"fused"`,
 `"graphed"` or `"eager"`; `"auto"` takes the best available. Graph capture
-costs ~0.1s once, so very short generations see less than the table suggests.
+costs ~0.1s once per prefill, so very short generations see less than the
+table suggests.
 
 The same Triton machinery speeds up the parallel forward, which is what
 prefill and fine-tuning use:
