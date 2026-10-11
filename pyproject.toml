@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dispatcher-hybrid-2"
-version = "0.1.0"
+version = "0.1.1"
 description = "An attention-light language model: gated dyadic shift-and-sum with a few sliding-window attention layers"
 readme = "README.md"
 requires-python = ">=3.10"

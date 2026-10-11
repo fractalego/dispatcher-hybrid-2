@@ -180,9 +180,11 @@ full attention stacks — binding capacity tracks the two attention layers.
 Beyond the 1024-token attention window arbitrary binding is effectively zero;
 semantic retrieval still works through the tree.
 
-**Generation is batch-1 on the fast path.** `generate()` handles batches but
-recomputes the prefix; the incremental decoders are single-sequence. Batched
-incremental decoding is not implemented.
+**Batched decoding is lockstep.** The fast decoders run equal-length rows in
+step (sampling N continuations of one prompt, or same-length prompts);
+variable-length batches are refused because the tree state is
+position-anchored and padding would corrupt it. `generate()` accepts any
+batch, at recompute cost.
 
 **Context is 4096 tokens**, fixed by the 12 dyadic levels. Longer contexts
 need additional levels (and the gates to be trained for them).
